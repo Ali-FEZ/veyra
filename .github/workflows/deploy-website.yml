@@ -1,0 +1,200 @@
+name: Deploy website to GitHub Pages
+
+# Manual deployment: upload a ZIP to the repo, then press
+# Actions -> "Deploy website to GitHub Pages" -> Run workflow.
+"on":
+  workflow_dispatch:
+    inputs:
+      zip_file:
+        description: "Path to the ZIP archive in the repo (e.g. website.zip). Leave empty to auto-detect when exactly one top-level ZIP exists."
+        required: false
+        default: ""
+        type: string
+      deploy_dir:
+        description: "Staging directory for the extracted site (Pages artifact source)."
+        required: false
+        default: "site"
+        type: string
+      strip_single_top_dir:
+        description: "If the ZIP contains one single top-level folder, move its contents up so index.html lands at the site root."
+        required: false
+        default: true
+        type: boolean
+
+# Least privilege at the top level. The deploy job elevates only
+# what Pages deployment requires.
+permissions:
+  contents: read
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Extract and validate ZIP
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5.0.0
+
+      - name: Locate, safely extract, and validate ZIP
+        shell: bash
+        env:
+          INPUT_ZIP_FILE: ${{ inputs.zip_file }}
+          INPUT_DEPLOY_DIR: ${{ inputs.deploy_dir }}
+          INPUT_STRIP: ${{ inputs.strip_single_top_dir }}
+        run: |
+          python3 - <<'PY'
+          import os, sys, zipfile, shutil, stat
+          from pathlib import Path
+
+          repo = Path(os.environ.get("GITHUB_WORKSPACE", ".")).resolve()
+          requested = (os.environ.get("INPUT_ZIP_FILE") or "").strip()
+          deploy_dir_name = (os.environ.get("INPUT_DEPLOY_DIR") or "site").strip() or "site"
+          strip = (os.environ.get("INPUT_STRIP") or "true").lower() not in ("false", "0", "no")
+
+          # --- Guard deploy_dir: never allow overwriting repo config ---
+          protected = {".git", ".github", ".gitignore", ".gitattributes", ".gitmodules"}
+          parts = [p for p in Path(deploy_dir_name).parts if p not in ("", ".")]
+          if not parts or parts[0] in protected or deploy_dir_name.startswith(("/", "~")) or ".." in parts:
+              print(f"::error::Refusing unsafe deploy_dir '{deploy_dir_name}'. Use a plain folder name like 'site'.")
+              sys.exit(1)
+
+          # --- Locate the ZIP ---
+          if requested:
+              zip_path = (repo / requested).resolve()
+              if not str(zip_path).startswith(str(repo)):
+                  print(f"::error::zip_file '{requested}' escapes the repository.")
+                  sys.exit(1)
+              if not zip_path.is_file():
+                  print(f"::error::Specified zip_file '{requested}' not found in the repository.")
+                  sys.exit(1)
+          else:
+              candidates = sorted([p for p in repo.glob("*.zip") if p.is_file()])
+              if len(candidates) == 0:
+                  print("::error::No ZIP archive found at the repository root. Upload your website ZIP (e.g. website.zip) to the repo root, or re-run and set the 'zip_file' input.")
+                  sys.exit(1)
+              if len(candidates) > 1:
+                  names = ", ".join(p.name for p in candidates)
+                  print(f"::error::Multiple ZIP files found at repo root: {names}. Re-run the workflow and set the 'zip_file' input to exactly one of them (e.g. {candidates[0].name}).")
+                  sys.exit(1)
+              zip_path = candidates[0]
+
+          print(f"Using archive: {zip_path.relative_to(repo)}")
+
+          if not zipfile.is_zipfile(zip_path):
+              print(f"::error::{zip_path.name} is not a valid ZIP archive.")
+              sys.exit(1)
+
+          deploy_dir = (repo / deploy_dir_name).resolve()
+          tmp_dir = repo / ".tmp-zip-extract"
+          if tmp_dir.exists():
+              shutil.rmtree(tmp_dir)
+          tmp_dir.mkdir(parents=True)
+
+          def is_symlink(info: zipfile.ZipInfo) -> bool:
+              # Unix file-type bits live in the upper 16 bits of external_attr.
+              return stat.S_ISLNK((info.external_attr >> 16) & 0xFFFF)
+
+          try:
+              with zipfile.ZipFile(zip_path) as zf:
+                  bad = zf.testzip()
+                  if bad is not None:
+                      print(f"::error::Archive is corrupt; first bad entry: {bad}")
+                      sys.exit(1)
+                  members = zf.infolist()
+                  if not members:
+                      print("::error::Archive is empty; nothing to deploy.")
+                      sys.exit(1)
+                  # NEVER execute anything from the archive; extraction only.
+                  for info in members:
+                      name = info.filename
+                      if name.startswith(("/", "\\")) or (len(name) > 1 and name[1] == ":"):
+                          print(f"::error::Blocked absolute path in archive: {name!r}")
+                          sys.exit(1)
+                      normalized = os.path.normpath(name.replace("\\", "/"))
+                      if normalized.startswith("..") or "/../" in normalized or normalized == "..":
+                          print(f"::error::Blocked path-traversal entry in archive: {name!r}")
+                          sys.exit(1)
+                      if is_symlink(info):
+                          print(f"::error::Blocked symlink entry in archive: {name!r}")
+                          sys.exit(1)
+                      target = (tmp_dir / normalized).resolve()
+                      if not str(target).startswith(str(tmp_dir.resolve())):
+                          print(f"::error::Blocked entry escaping destination: {name!r}")
+                          sys.exit(1)
+                  for info in members:
+                      zf.extract(info, tmp_dir)
+          except SystemExit:
+              raise
+          except Exception as exc:
+              print(f"::error::Extraction failed: {exc}")
+              sys.exit(1)
+
+          # --- Handle optional single top-level directory ---
+          top_items = list(tmp_dir.iterdir())
+          if strip and len(top_items) == 1 and top_items[0].is_dir() and not (tmp_dir / "index.html").is_file():
+              inner = top_items[0]
+              if (inner / "index.html").is_file():
+                  print(f"Flattening single top-level folder '{inner.name}/' so index.html lands at the site root.")
+                  for item in inner.iterdir():
+                      shutil.move(str(item), str(tmp_dir / item.name))
+                  inner.rmdir()
+              else:
+                  print(f"::warning::Single top-level folder '{inner.name}/' has no index.html directly inside; keeping structure as-is.")
+
+          # --- Validate: index.html must exist at site root ---
+          index = tmp_dir / "index.html"
+          if not index.is_file():
+              found = sorted(str(p.relative_to(tmp_dir)) for p in tmp_dir.rglob("index.html"))
+              hint = f" Found index.html at: {', '.join(found)}." if found else ""
+              print(f"::error::Validation failed: index.html not found at the site root after extraction.{hint} Make sure the ZIP contains index.html at its top level (or inside one single top folder).")
+              sys.exit(1)
+          if index.stat().st_size == 0:
+              print("::error::Validation failed: index.html is empty.")
+              sys.exit(1)
+
+          # --- Publish to deploy_dir (artifact staging only) ---
+          # The original ZIP is never moved or deleted. Only deploy_dir is replaced.
+          # .git, .github, and other repo config are never touched because we
+          # write exclusively inside deploy_dir.
+          if deploy_dir.exists():
+              shutil.rmtree(deploy_dir)
+          deploy_dir.mkdir(parents=True)
+          for item in tmp_dir.iterdir():
+              shutil.move(str(item), str(deploy_dir / item.name))
+          shutil.rmtree(tmp_dir, ignore_errors=True)
+
+          # .nojekyll disables Jekyll processing so files/folders starting
+          # with '_' are served as-is. This is the only file we add.
+          (deploy_dir / ".nojekyll").touch()
+
+          count = sum(1 for _ in deploy_dir.rglob("*"))
+          print(f"Site staged in '{deploy_dir_name}/' ({count} files/dirs). index.html OK.")
+          print("Original ZIP preserved; no repo files outside "
+                f"'{deploy_dir_name}/' were modified, and nothing was committed.")
+          PY
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3.0.1
+        with:
+          path: ${{ inputs.deploy_dir != '' && inputs.deploy_dir || 'site' }}
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4.0.5
