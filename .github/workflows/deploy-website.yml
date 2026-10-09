@@ -36,10 +36,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v5.0.0
 
       - name: Setup Pages
-        uses: actions/configure-pages@v5.0.0
+        uses: actions/configure-pages@v6.0.0
 
       - name: Locate, safely extract, and validate ZIP
         shell: bash
@@ -113,9 +113,11 @@ jobs:
                   # NEVER execute anything from the archive; extraction only.
                   for info in members:
                       name = info.filename
+                      # Skip directory entries silently; reject absolute paths and traversal.
                       if name.startswith(("/", "\\")) or (len(name) > 1 and name[1] == ":"):
                           print(f"::error::Blocked absolute path in archive: {name!r}")
                           sys.exit(1)
+                      # Normalise to POSIX then check for '..' escape.
                       normalized = os.path.normpath(name.replace("\\", "/"))
                       if normalized.startswith("..") or "/../" in normalized or normalized == "..":
                           print(f"::error::Blocked path-traversal entry in archive: {name!r}")
@@ -127,6 +129,7 @@ jobs:
                       if not str(target).startswith(str(tmp_dir.resolve())):
                           print(f"::error::Blocked entry escaping destination: {name!r}")
                           sys.exit(1)
+                  # All members passed validation: extract now.
                   for info in members:
                       zf.extract(info, tmp_dir)
           except SystemExit:
@@ -170,7 +173,8 @@ jobs:
           shutil.rmtree(tmp_dir, ignore_errors=True)
 
           # .nojekyll disables Jekyll processing so files/folders starting
-          # with '_' are served as-is. This is the only file we add.
+          # with '_' (e.g. _assets) and other static files are served as-is.
+          # This is the only file we add; your site sources are not modified.
           (deploy_dir / ".nojekyll").touch()
 
           count = sum(1 for _ in deploy_dir.rglob("*"))
@@ -180,9 +184,12 @@ jobs:
           PY
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3.0.1
+        uses: actions/upload-pages-artifact@v5.0.0
         with:
           path: ${{ inputs.deploy_dir != '' && inputs.deploy_dir || 'site' }}
+          # v4+ excludes dotfiles by default; this preserves the .nojekyll
+          # file created during extraction so Jekyll processing stays disabled.
+          include-hidden-files: true
 
   deploy:
     name: Deploy to GitHub Pages
@@ -197,4 +204,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4.0.5
+        uses: actions/deploy-pages@v5.0.1
